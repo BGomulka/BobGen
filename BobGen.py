@@ -1,37 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Wed Jun  3 00:41:20 2026
-
-@author: brennen
-"""
 
 import sys
+import csv
 from pathlib import Path
 import argparse
 import time
 import xml.etree.ElementTree as ET
+import logging
 
-try:
-    import pandas as pd
-except ImportError:
-    print("Error: The 'pandas' library is required. Install it using 'pip install pandas openpyxl'.")
-    sys.exit(1)
+logging.basicConfig(level=logging.WARNING, format='%(message)s')
+logger = logging.getLogger(__name__)
 
-def generate_bob(excel_path, output_path):
+def generate_bob(csv_path, output_path):
     try:
-        df = pd.read_excel(excel_path, engine='openpyxl')
-    except ValueError as ve:
-        print(f"  -> Format Error: Ensure openpyxl is installed and the file is a valid .xlsx file. ({ve})")
-        return
+        with open(csv_path, mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
     except Exception as e:
-        print(f"  -> Error loading {excel_path.name}: {e}")
-        return
-
-    df = df.dropna(subset=['Record Type', 'Record Name'])
+        logger.error(f"  -> Error loading {csv_path.name}: {e}")
+        return False
 
     root = ET.Element("display", version="2.0.0")
-    ET.SubElement(root, "name").text = f"Batch Testing Screen - {excel_path.stem}"
+    ET.SubElement(root, "name").text = f"Batch Testing Screen - {csv_path.stem}"
     
     ET.SubElement(root, "width").text = "1200"
     ET.SubElement(root, "height").text = "1200"
@@ -45,11 +36,11 @@ def generate_bob(excel_path, output_path):
     y_counters = {}
     widgets_added = 0
 
-    for _, row in df.iterrows():
-        rec_type = str(row["Record Type"]).strip().upper()
-        rec_name = str(row["Record Name"]).strip()
+    for row in rows:
+        rec_type = str(row.get("Record Type", "")).strip().upper()
+        rec_name = str(row.get("Record Name", "")).strip()
 
-        if not rec_type or not rec_name or rec_name.lower() == 'nan':
+        if not rec_type or not rec_name or rec_name.lower() in ('nan', ''):
             continue
 
         if rec_type not in x_positions:
@@ -85,8 +76,8 @@ def generate_bob(excel_path, output_path):
         widgets_added += 1
 
     if widgets_added == 0:
-        print(f"  -> Warning: No valid records parsed from {excel_path.name}. Skipping file save.")
-        return
+        logger.warning(f"  -> Warning: No valid records parsed from {csv_path.name}. Skipping file save.")
+        return False
 
     max_y = max(y_counters.values()) if y_counters else 1000
     max_x = START_X + (len(x_positions) * X_SPACING) + 50
@@ -95,103 +86,123 @@ def generate_bob(excel_path, output_path):
 
     tree = ET.ElementTree(root)
     tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    return True
 
-def process_directory(input_path, output_base_path, folder_modifier=None, is_test=False):
-    start_time = time.time()
-    input_dir = Path(input_path).resolve()
-    base_output = Path(output_base_path).resolve()
+def resolve_files(input_path, is_batch, is_test, ext):
+    in_p = Path(input_path).resolve() if input_path else Path.cwd()
+    files = []
     
-    if not input_dir.is_dir():
-        print(f"Error: Source directory '{input_dir}' does not exist.")
-        return
-
-    subdirs = [d for d in input_dir.iterdir() if d.is_dir()]
-    total_subdirs_count = len(list(input_dir.rglob('*'))) - len(list(input_dir.rglob('*.xlsx')))
-
+    if is_batch:
+        if in_p.is_dir():
+            files = list(in_p.rglob(f"*{ext}"))
+        else:
+            logger.error(f"Error: Batch mode requires a directory. '{in_p}' is a file.")
+            sys.exit(1)
+    else:
+        if in_p.is_file() and in_p.suffix == ext:
+            files = [in_p]
+        elif in_p.is_dir():
+            found = list(in_p.glob(f"*{ext}"))
+            if found:
+                files = [found[0]]
+                logger.info(f"Single file mode: Auto-selected first valid file '{files[0].name}'.")
+            
     if is_test:
-        has_test_folder = any(d.name.startswith("test_") for d in subdirs)
-        if not has_test_folder:
-            raise ValueError(
-                "\n[ERROR] Test mode validation failed!\n"
-                "To run in test mode, your input directory must contain at least one folder "
-                "named with the format: 'test_*foldername*' (e.g., test_device1)."
-            )
+        files = [f for f in files if f.name.lower().startswith("test")]
+        if not files:
+            logger.error("\n[ERROR] Test mode validation failed! No files starting with 'test' found.")
+            sys.exit(1)
+            
+    return sorted(list(set(files))), in_p
+
+def process_pipeline(args):
+    start_time = time.time()
+    
+    if args.verbose:
+        logger.setLevel(logging.INFO)
+
+    input_files, input_dir = resolve_files(args.input, args.batch, args.test, '.csv')
+    base_output = Path(args.output).resolve() if args.output else Path.cwd()
+    
+    if args.test:
         final_output_root = base_output / "test"
-    elif folder_modifier:
-        final_output_root = base_output / folder_modifier
+    elif args.folder_name:
+        final_output_root = base_output / args.folder_name
     else:
         final_output_root = base_output
 
-    excel_files = list(input_dir.glob('*.xlsx')) + list(input_dir.rglob('*.xlsx'))
-    excel_files = sorted(list(set(excel_files)))
-    total_files = len(excel_files)
-
+    total_files = len(input_files)
     if total_files == 0:
-        print(f"No .xlsx files found in {input_dir} or its subfolders.")
+        logger.error(f"No valid .csv files found to process.")
         return
     
-    print(f"Found {total_files} Excel file(s). Starting Excel -> Phoebus .bob conversion...\n")
+    logger.info(f"Found {total_files} CSV file(s). Starting CSV -> Phoebus .bob conversion...\n")
     
-    for index, excel_path in enumerate(excel_files, start=1):
-        relative_path = excel_path.relative_to(input_dir)
-        target_subdir = final_output_root / relative_path.parent
+    success_count = 0
+    for index, csv_path in enumerate(input_files, start=1):
+        if args.batch:
+            relative_path = csv_path.relative_to(input_dir)
+            target_subdir = final_output_root / relative_path.parent
+        else:
+            target_subdir = final_output_root
+            
         target_subdir.mkdir(parents=True, exist_ok=True)
         
-        prefix = "test_" if is_test else ""
-        output_filename = f"{prefix}{excel_path.with_suffix('.bob').name}"
+        output_filename = csv_path.with_suffix('.bob').name
         target_output_path = target_subdir / output_filename
         
         percentage = (index / total_files) * 100
-        print(f"[{percentage:.1f}%] Processing file {index} of {total_files}:")
-        print(f"  Input:  {excel_path.name}")
-        print(f"  Output: {target_output_path}")
+        logger.info(f"[{percentage:.1f}%] Processing file {index} of {total_files}:")
+        logger.info(f"  Input:  {csv_path.name}")
+        logger.info(f"  Output: {target_output_path}")
         
         try:
-             generate_bob(excel_path, target_output_path)
-             print("  Status: Successfully converted")
+            if generate_bob(csv_path, target_output_path):
+                logger.info("  Status: Successfully converted")
+                success_count += 1
         except (FileNotFoundError, PermissionError) as io_err:
-             print(f"  Status: File Access Error - {io_err}")
+            logger.error(f"  Status: File Access Error - {io_err}")
         except Exception as e:
-             print(f"  Status: Unexpected Error - {e}")
-        print("-" * 50)
+            logger.error(f"  Status: Unexpected Error - {e}")
+            
+        logger.info("-" * 50)
          
-    elapsed_time = time.time() - start_time
+    if args.verbose:
+        elapsed_time = time.time() - start_time
+        logger.info("\n" + "="*60)
+        logger.info("EXECUTION DETAILS SUMMARY")
+        logger.info("="*60)
+        logger.info(f"Target Input Path:        {input_dir}")
+        logger.info(f"Total Files Processed:    {total_files}")
+        logger.info(f"Total Success:            {success_count}")
+        logger.info(f"Output Root Directory:    {final_output_root}")
+        logger.info(f"Test Mode Active:         {args.test}")
+        logger.info(f"Batch Mode Active:        {args.batch}")
+        logger.info(f"Total Execution Time:     {elapsed_time:.2f} seconds")
+        logger.info("="*60 + "\n")
     
-    print("\n" + "="*60)
-    print("EXECUTION DETAILS SUMMARY")
-    print("="*60)
-    print(f"Input Directory:          {input_dir}")
-    print(f"Total Subdirectories:     {total_subdirs_count}")
-    print(f"Total Files Processed:    {total_files}")
-    print(f"Output Root Directory:    {final_output_root}")
-    print(f"Test Mode Active:         {is_test}")
-    print(f"Total Execution Time:     {elapsed_time:.2f} seconds")
-    print("="*60 + "\n")
+    print("Complete")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batch convert .xlsx files to Phoebus .bob UI screens")
+    parser = argparse.ArgumentParser(description="Convert .csv files to Phoebus .bob UI screens")
     
-    parser.add_argument("-i", "--source_directory", required=True, 
-                        help="Path to directory containing input .xlsx files or folders")
-    
-    parser.add_argument("-o", "--output_directory", required=True,
-                        help="Path to the base directory where output files/folders will be placed")
-    
+    parser.add_argument("-i", "--input", default=None, 
+                        help="Path to input .csv file or directory (Defaults to Current Working Directory)")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Path to save output (Defaults to Current Working Directory)")
+    parser.add_argument("-b", "--batch", action="store_true",
+                        help="Process directories recursively instead of a single file")
     parser.add_argument("-f", "--folder_name", default=None,
                         help="Optional: Create a specific folder inside the output directory to place files in")
-    
     parser.add_argument("-t", "--test", action="store_true", 
-                        help="Run in test mode (requires 'test_*' subfolders, creates a 'test/' folder inside -o)")
+                        help="Run in test mode (only processes files starting with 'test')")
+    parser.add_argument("-v", "--verbose", action="store_true", 
+                        help="Enable detailed logging output")
     
     args = parser.parse_args()
     
     try:
-        process_directory(
-            input_path=args.source_directory, 
-            output_base_path=args.output_directory, 
-            folder_modifier=args.folder_name, 
-            is_test=args.test
-        )
-    except ValueError as err:
-        print(err)
+        process_pipeline(args)
+    except Exception as err:
+        logger.error(err)
         sys.exit(1)
